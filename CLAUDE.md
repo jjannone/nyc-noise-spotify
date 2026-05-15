@@ -34,7 +34,9 @@ Before running, verify:
 - `fetch_today_listings()` parses the homepage by finding the `<h4>` whose inner `<a href>` ends with `#MMDDYY`, then collects siblings until the next `<h4>`. If it fails with "Could not find today's section", the site's HTML structure changed.
 - Artist extraction uses Sonnet 4.6 (`claude-sonnet-4-6`). The prompt is in `EXTRACTION_PROMPT`.
 - Spotify's Get-Artist-Top-Tracks endpoint was removed Feb 2026, so the script uses **search artist → recent albums → first track of each**. This is intentional, not a stopgap.
+- **Strict match-verification pass.** `search_artist_tracks()` keeps only Spotify results whose name exact-matches (case-insensitive, normalized) the searched name, then calls `verify_artist_match()` — Claude picks the right candidate based on genre relevance (experimental / noise / electronic / free jazz / avant-garde / etc., per `VERIFY_PROMPT`) or rejects all. No fallback to track-search: if no relevant exact-match exists, the artist is skipped rather than risking a false positive like "Freddy K" → Freddie King.
 - OAuth uses Authorization Code + PKCE. Refresh tokens persist in `.nyc-noise/spotify_token.json`.
+- **Cache versioning.** `CACHE_SCHEMA` is part of the artist-cache key. Bump it whenever matching logic changes so old cached URIs don't poison new results.
 
 ## What NOT to do
 
@@ -52,7 +54,7 @@ Before running, verify:
 
 ## Open improvements (in priority order)
 
-1. **Match-verification pass**: after Spotify search returns a candidate, optionally send `{searched_for, got_back}` to Claude to confirm the match isn't a false positive (e.g. NYC noise act "Tanya" → Tanya Tucker). Mentioned in the original design discussion; not yet implemented.
-2. **`--dry-run` flag**: extract + search but don't post to Spotify.
-3. **Richer extraction**: have Claude return structured event objects (venue, time, artists, headliner) instead of a flat artist list. Enables venue-grouped playlists, headliner-weighted track counts, etc.
-4. **Headliner emphasis**: 3 tracks for the first artist in each event, 1 for supporting acts.
+1. **`--dry-run` flag**: extract + search but don't post to Spotify.
+2. **Richer extraction**: have Claude return structured event objects (venue, time, artists, headliner) instead of a flat artist list. Enables venue-grouped playlists, headliner-weighted track counts, etc.
+3. **Headliner emphasis**: 3 tracks for the first artist in each event, 1 for supporting acts.
+4. **Split `/`-joined collaboratives** when no Spotify match exists for the joined string. The extraction prompt currently treats `A / B / C` as one entry, which is correct for canonical groups but produces zero matches for ad-hoc improv lineups; could fall back to searching each member individually.

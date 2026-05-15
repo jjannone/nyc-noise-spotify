@@ -53,6 +53,10 @@ NYC_NOISE_URL = "https://nyc-noise.com"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 TRACKS_PER_ARTIST = 2  # adjust 1-3
 
+# Bump when the cache representation or matching logic changes, so old caches
+# auto-invalidate instead of producing stale wrong matches.
+CACHE_SCHEMA = "v2"
+
 
 # ---------- env loading ----------
 
@@ -277,41 +281,118 @@ def save_artist_cache(cache: dict) -> None:
     ARTIST_CACHE_FILE.write_text(json.dumps(cache, indent=2))
 
 
-def search_artist_tracks(name: str, token: str, n_tracks: int) -> list[str]:
-    """
-    Find Spotify artist, then fetch their tracks. Returns list of URIs.
+VERIFY_PROMPT = """\
+You verify Spotify artist matches for a playlist sourced from nyc-noise.com,
+a NYC experimental/noise music calendar.
 
-    Because Get-Artist-Top-Tracks was removed Feb 2026:
-      1) /search?type=artist to find canonical artist ID
-      2) /artists/{id}/albums (album_type=album,single, recent)
-      3) /albums/{id}/tracks → take first track each
-    Falls back to track-search if artist isn't found.
+Searched name: "{searched}"
+
+Spotify candidates whose names exact-match (case-insensitive):
+{candidates_block}
+
+Rules:
+1. RELEVANCE: the artist must plausibly perform music in one of these areas:
+   experimental, improvisational, avant-garde, noise, electronic, free jazz,
+   ambient, drone, industrial, IDM, techno, house, post-punk, free improvisation,
+   modern classical, harsh noise, contemporary composition, leftfield, or other
+   underground/non-mainstream music. REJECT mainstream pop, country, religious,
+   blues-rock standards, classical-orchestral standards, holiday music, mariachi,
+   children's, etc.
+2. UNLABELED ARTISTS: if a candidate has no genres listed, low popularity
+   (under ~30) is itself a signal this is an obscure underground artist —
+   accept it if the name matches exactly and nothing else disqualifies it.
+3. MULTIPLE MATCHES: if more than one candidate qualifies, pick the most
+   relevant (genres closest to the list in rule 1).
+
+Return ONLY a JSON object on a single line:
+  {{"choice": <1-based index of chosen candidate>}}
+or, if none qualify:
+  {{"choice": null, "reason": "<short reason>"}}
+"""
+
+
+def _normalize_name(s: str) -> str:
+    """Lowercase, collapse whitespace, strip common punctuation for exact-match."""
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[’'`´]", "'", s)
+    return s
+
+
+def verify_artist_match(
+    client: anthropic.Anthropic, searched: str, candidates: list[dict]
+) -> Optional[int]:
+    """Ask Claude to pick the right Spotify artist (or reject all).
+
+    Returns the 0-based index into `candidates`, or None to skip the artist.
+    """
+    if not candidates:
+        return None
+    lines = []
+    for i, a in enumerate(candidates, 1):
+        genres = a.get("genres") or []
+        genre_str = ", ".join(genres) if genres else "(no genres listed)"
+        lines.append(
+            f'{i}. "{a["name"]}" — genres: [{genre_str}], popularity: {a.get("popularity", "?")}'
+        )
+    prompt = VERIFY_PROMPT.format(searched=searched, candidates_block="\n".join(lines))
+
+    try:
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in msg.content if b.type == "text").strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+        data = json.loads(text)
+    except (anthropic.APIError, json.JSONDecodeError) as e:
+        # Be strict: if verification can't run, skip rather than guess.
+        print(f"    (verify error for {searched!r}: {e} — skipping)")
+        return None
+
+    choice = data.get("choice")
+    if choice is None or not isinstance(choice, int):
+        return None
+    if not (1 <= choice <= len(candidates)):
+        return None
+    return choice - 1
+
+
+def search_artist_tracks(
+    name: str, token: str, n_tracks: int, anthropic_client: anthropic.Anthropic
+) -> list[str]:
+    """
+    Find Spotify artist, verify with Claude, then fetch their tracks.
+
+    Returns list of URIs. Strict matching:
+      1) /search?type=artist
+      2) keep only candidates whose name exact-matches (normalized)
+      3) ask Claude to pick the right one by genre relevance, or reject all
+      4) /artists/{id}/albums → first track of each recent album
+
+    No fallback to track-search — better to skip than add wrong music.
     """
     headers = {"Authorization": f"Bearer {token}"}
 
     r = requests.get(
         "https://api.spotify.com/v1/search",
         headers=headers,
-        params={"q": name, "type": "artist", "limit": 5},
+        params={"q": name, "type": "artist", "limit": 10},
     )
     if r.status_code != 200:
         return []
     artists = r.json().get("artists", {}).get("items", [])
-    if not artists:
-        r = requests.get(
-            "https://api.spotify.com/v1/search",
-            headers=headers,
-            params={"q": name, "type": "track", "limit": n_tracks},
-        )
-        if r.status_code != 200:
-            return []
-        return [t["uri"] for t in r.json().get("tracks", {}).get("items", [])]
 
-    name_lc = name.lower()
-    artist = next(
-        (a for a in artists if a["name"].lower() == name_lc),
-        next((a for a in artists if a["name"].lower().startswith(name_lc)), artists[0]),
-    )
+    norm = _normalize_name(name)
+    exact = [a for a in artists if _normalize_name(a["name"]) == norm]
+    if not exact:
+        return []
+
+    idx = verify_artist_match(anthropic_client, name, exact)
+    if idx is None:
+        return []
+    artist = exact[idx]
     artist_id = artist["id"]
 
     r = requests.get(
@@ -474,12 +555,12 @@ def main():
     all_uris = []
     hits, misses = [], []
     for a in artists:
-        cache_key = f"{a}::{TRACKS_PER_ARTIST}"
+        cache_key = f"{a}::{TRACKS_PER_ARTIST}::{CACHE_SCHEMA}"
         if cache_key in cache:
             uris = cache[cache_key]
             print(f"  ⌐ {a} → {len(uris)} (cached)")
         else:
-            uris = search_artist_tracks(a, token, TRACKS_PER_ARTIST)
+            uris = search_artist_tracks(a, token, TRACKS_PER_ARTIST, anthropic_client)
             cache[cache_key] = uris
             time.sleep(0.05)
             print(f"  {'✓' if uris else '✗'} {a} → {len(uris)} tracks")
