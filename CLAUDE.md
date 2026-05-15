@@ -45,6 +45,11 @@ Before running, verify:
 - Don't add a "create playlist programmatically" feature — the endpoint is gone in Dev Mode. If asked, suggest applying for Extended Quota Mode with Spotify, or stick with the manual one-click create.
 - Don't call audio-features, audio-analysis, recommendations, or related-artists endpoints — all removed Feb 2026.
 
+## Spotify API gotchas
+
+- **Use `/items`, not `/tracks`, for playlist mutations.** `POST /v1/playlists/{id}/tracks` is deprecated and Dev Mode apps now get a bare `403 Forbidden` from it with no `www-authenticate` header — easy to mistake for a scope/ownership problem. The replacement is `POST /v1/playlists/{id}/items` (same `{uris: [...]}` payload, returns `201` + `snapshot_id`). Same rename applies to `DELETE` — the new endpoint also takes a different payload shape.
+- **When debugging a Spotify 403, before suspecting scopes/ownership:** verify the endpoint isn't deprecated. Symptom pattern = reads succeed, writes 403, no `www-authenticate` / `X-Message` headers → check current docs for the endpoint path. Design-time notes (including the ones in [CHAT_CONTEXT.md](CHAT_CONTEXT.md)) can go stale; Spotify's 2026 contraction is ongoing.
+
 ## Open improvements (in priority order)
 
 1. **Match-verification pass**: after Spotify search returns a candidate, optionally send `{searched_for, got_back}` to Claude to confirm the match isn't a false positive (e.g. NYC noise act "Tanya" → Tanya Tucker). Mentioned in the original design discussion; not yet implemented.
