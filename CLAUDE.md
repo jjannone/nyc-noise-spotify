@@ -1,0 +1,53 @@
+# nyc-noise-playlist — guidance for Claude Code
+
+Daily tool: scrape nyc-noise.com → extract artists with Claude → build a Spotify playlist named `nyc-noise-MM.DD.YY`.
+
+## Daily run
+
+```bash
+python3 nyc_noise_playlist.py
+```
+
+The script will pause and ask the user to create a Spotify playlist named exactly `nyc-noise-MM.DD.YY` for today, then paste its URL.
+
+**Do not try to create the playlist for the user.** Spotify's API removed playlist-creation in Feb 2026 for Dev Mode apps. The user creates it manually in the Spotify app, then pastes the URL back. If the user has already created the playlist, you can run:
+
+```bash
+python3 nyc_noise_playlist.py --playlist-url <url>
+```
+
+## Setup checks
+
+Before running, verify:
+- `.env` exists with `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI`, `ANTHROPIC_API_KEY`
+- Deps installed: `pip3 install -r requirements.txt`
+
+## Common tasks
+
+- **Re-run today** with a different playlist: delete the date key from `.nyc-noise/playlist_cache.json`, create a new playlist in Spotify, re-run.
+- **Clear artist cache** (e.g. after Spotify catalog updates): `rm .nyc-noise/artist_cache.json`
+- **Re-auth Spotify**: `rm .nyc-noise/spotify_token.json`
+- **Inspect today's extraction without writing to Spotify**: not currently supported — would need a `--dry-run` flag.
+
+## Architecture notes
+
+- `fetch_today_listings()` parses the homepage by finding the `<h4>` whose inner `<a href>` ends with `#MMDDYY`, then collects siblings until the next `<h4>`. If it fails with "Could not find today's section", the site's HTML structure changed.
+- Artist extraction uses Sonnet 4.6 (`claude-sonnet-4-6`). The prompt is in `EXTRACTION_PROMPT`.
+- Spotify's Get-Artist-Top-Tracks endpoint was removed Feb 2026, so the script uses **search artist → recent albums → first track of each**. This is intentional, not a stopgap.
+- OAuth uses Authorization Code + PKCE. Refresh tokens persist in `.nyc-noise/spotify_token.json`.
+
+## What NOT to do
+
+- Don't commit `.env` or `.nyc-noise/` — both are gitignored for good reason.
+- Don't switch to Spotify Client Credentials flow — playlist modification needs user auth.
+- Don't switch to deprecated Implicit Grant.
+- **Don't try to replace the Claude extraction with regex.** The listing format is too varied; that's why we use the LLM. Several rounds of this were considered and rejected.
+- Don't add a "create playlist programmatically" feature — the endpoint is gone in Dev Mode. If asked, suggest applying for Extended Quota Mode with Spotify, or stick with the manual one-click create.
+- Don't call audio-features, audio-analysis, recommendations, or related-artists endpoints — all removed Feb 2026.
+
+## Open improvements (in priority order)
+
+1. **Match-verification pass**: after Spotify search returns a candidate, optionally send `{searched_for, got_back}` to Claude to confirm the match isn't a false positive (e.g. NYC noise act "Tanya" → Tanya Tucker). Mentioned in the original design discussion; not yet implemented.
+2. **`--dry-run` flag**: extract + search but don't post to Spotify.
+3. **Richer extraction**: have Claude return structured event objects (venue, time, artists, headliner) instead of a flat artist list. Enables venue-grouped playlists, headliner-weighted track counts, etc.
+4. **Headliner emphasis**: 3 tracks for the first artist in each event, 1 for supporting acts.
