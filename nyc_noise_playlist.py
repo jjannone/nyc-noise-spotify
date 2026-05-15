@@ -413,7 +413,7 @@ def add_tracks(playlist_id: str, uris: list[str], token: str) -> None:
     for i in range(0, len(uris), 100):
         chunk = uris[i:i+100]
         r = requests.post(
-            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
             headers=headers, json={"uris": chunk},
         )
         if not r.ok:
