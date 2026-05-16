@@ -70,10 +70,10 @@ def load_env() -> dict:
                 continue
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
-    # env vars override .env
+    # Non-empty env vars override .env (empty exports must not shadow real values)
     for k in ("SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
               "SPOTIFY_REDIRECT_URI", "ANTHROPIC_API_KEY"):
-        if k in os.environ:
+        if os.environ.get(k):
             env[k] = os.environ[k]
     return env
 
