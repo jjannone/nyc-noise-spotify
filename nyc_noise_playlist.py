@@ -632,14 +632,18 @@ def main():
         print(f"  name:        {post['name']}")
         print(f"  tracks:      {post['total']} (expected {expected_total})")
         print(f"  snapshot:    {post['snapshot_id']}")
-        if post["snapshot_id"] == pre["snapshot_id"]:
-            sys.exit("✗ Snapshot didn't change — Spotify silently rejected the write.")
         delta = post["total"] - pre["total"]
+        if delta == 0:
+            sys.exit("✗ Track count unchanged — Spotify silently rejected the write.")
         if delta != len(deduped):
             print(
                 f"⚠  Added {delta} tracks but expected {len(deduped)}. "
                 "Some URIs may have been silently dropped by Spotify."
             )
+        # snapshot_id from GET /playlists/{id} can lag behind writes (CDN/eventual
+        # consistency); the count delta is the reliable signal. Note it but don't fail.
+        if post["snapshot_id"] == pre["snapshot_id"]:
+            print("  (snapshot id unchanged in the GET response — Spotify caching, not a failure)")
 
     # 6. summary
     print("\n" + "─" * 50)
