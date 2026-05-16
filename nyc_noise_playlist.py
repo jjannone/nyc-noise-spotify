@@ -239,29 +239,103 @@ def save_bandcamp_cache(cache: dict) -> None:
     BANDCAMP_CACHE_FILE.write_text(json.dumps(cache, indent=2))
 
 
-def bandcamp_search_artist(name: str) -> Optional[str]:
-    """Return the Bandcamp URL for an artist (band-type result), or None."""
+BANDCAMP_VERIFY_PROMPT = """\
+You verify Bandcamp artist matches for an NYC experimental/noise music
+listings page (nyc-noise.com).
+
+Searched name: "{searched}"
+
+Bandcamp candidates (loose matches — names won't exact-match):
+{candidates_block}
+
+Rules:
+1. NAME: the candidate's name must clearly refer to the same artist as the
+   searched name. Allowed: variant spellings, capitalization, diacritic
+   differences, common abbreviations, "X (alias)" formats, parenthetical
+   descriptors, numeric suffixes Spotify-style. NOT allowed: completely
+   different names (e.g. "Freddy K" vs "Freddie King") or coincidental
+   substring matches.
+2. RELEVANCE: the artist must plausibly perform experimental, improvisational,
+   avant-garde, noise, electronic, free jazz, ambient, drone, industrial, IDM,
+   techno, house, post-punk, free improvisation, modern classical, or related
+   underground/leftfield music. Use tags/genre and location signals.
+3. If multiple qualify, pick the best combined name+genre match.
+
+Return ONLY JSON: {{"choice": <1-based index>}} or
+{{"choice": null, "reason": "<short>"}}
+"""
+
+
+def _bandcamp_search_raw(name: str) -> list[dict]:
     try:
         r = requests.post(
             "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic",
             headers={"Content-Type": "application/json"},
-            json={"search_text": name, "search_filter": "b", "full_page": False, "fan_id": None},
+            json={"search_text": name, "search_filter": "b",
+                  "full_page": False, "fan_id": None},
             timeout=15,
         )
         if not r.ok:
-            return None
-        results = r.json().get("auto", {}).get("results", [])
+            return []
+        return r.json().get("auto", {}).get("results", [])
     except (requests.RequestException, json.JSONDecodeError):
+        return []
+
+
+def bandcamp_search_artist(
+    name: str, anthropic_client: Optional[anthropic.Anthropic] = None
+) -> Optional[str]:
+    """Return the Bandcamp URL for an artist, or None.
+
+    Strategy:
+      1. Exact (normalized) name match among band-type results — accept.
+      2. If no exact and an anthropic_client is available, ask Claude to pick
+         a loose match from the top band candidates (or reject all).
+    """
+    results = _bandcamp_search_raw(name)
+    bands = [r for r in results if r.get("type") == "b"]
+    if not bands:
         return None
 
     norm = _normalize_name(name)
-    for res in results:
-        if res.get("type") != "b":
-            continue
+    for res in bands:
         url = res.get("item_url_root") or res.get("url")
         if _normalize_name(res.get("name", "")) == norm and url:
             return url
-    return None
+
+    # Loose fallback with Claude verification
+    if anthropic_client is None:
+        return None
+
+    candidates = bands[:5]
+    lines = []
+    for i, c in enumerate(candidates, 1):
+        tags = ", ".join(c.get("tag_names") or []) or "(no tags)"
+        loc = c.get("location") or "(no location)"
+        genre = c.get("genre_name") or "(no genre)"
+        lines.append(
+            f'{i}. "{c.get("name")}" — genre: {genre}, tags: [{tags}], location: {loc}'
+        )
+    prompt = BANDCAMP_VERIFY_PROMPT.format(
+        searched=name, candidates_block="\n".join(lines)
+    )
+    try:
+        msg = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in msg.content if b.type == "text").strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+        data = json.loads(text)
+    except (anthropic.APIError, json.JSONDecodeError):
+        return None
+
+    choice = data.get("choice")
+    if not isinstance(choice, int) or not (1 <= choice <= len(candidates)):
+        return None
+    chosen = candidates[choice - 1]
+    return chosen.get("item_url_root") or chosen.get("url")
 
 
 def build_bandcamp_html(date_str: str, listings_html: str, artist_links: dict) -> str:
@@ -308,7 +382,8 @@ def build_bandcamp_html(date_str: str, listings_html: str, artist_links: dict) -
                 url = artist_links.get(key) if key else None
                 if url:
                     a = soup.new_tag("a", href=url, target="_blank",
-                                      rel="noopener noreferrer")
+                                      rel="noopener noreferrer",
+                                      attrs={"class": "bandcamp"})
                     a.string = matched
                     pieces.append(a)
                 else:
@@ -329,10 +404,23 @@ def build_bandcamp_html(date_str: str, listings_html: str, artist_links: dict) -
              max-width: 720px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }
       h1 { font-size: 1.4em; margin-bottom: 1em; }
       h4 { margin-top: 1.5em; }
-      a { color: #1d68d6; text-decoration: none; border-bottom: 1px solid #1d68d680; }
-      a:hover { background: #1d68d610; }
-      span.no-match { color: #999; text-decoration: line-through; }
+      /* Default styling for nyc-noise.com's original links (venues, anchors) */
+      a { color: #555; text-decoration: none; border-bottom: 1px dotted #999; }
+      a:hover { color: #000; }
+      /* Bandcamp links injected by this script — visually distinct */
+      a.bandcamp {
+        color: #1da0c3;
+        background: #1da0c310;
+        border-bottom: 1px solid #1da0c3;
+        padding: 0 2px;
+      }
+      a.bandcamp:hover { background: #1da0c330; color: #137a96; }
+      span.no-match { color: #aaa; text-decoration: line-through; }
       .summary { color: #666; font-size: 0.9em; margin-bottom: 1.5em; }
+      .legend { font-size: 0.85em; color: #666; margin: 0.5em 0 1.5em; }
+      .legend .swatch {
+        display: inline-block; padding: 0 6px; border-radius: 3px; margin-right: 4px;
+      }
     """
     matched_count = sum(1 for v in artist_links.values() if v)
     return f"""<!doctype html>
@@ -340,8 +428,12 @@ def build_bandcamp_html(date_str: str, listings_html: str, artist_links: dict) -
 <title>nyc-noise {date_str} (with bandcamp links)</title>
 <style>{css}</style></head><body>
 <h1>nyc-noise — {date_str}</h1>
-<p class="summary">{matched_count} of {len(artist_links)} artists found on Bandcamp.
-Greyed/struck names had no exact Bandcamp match.</p>
+<p class="summary">{matched_count} of {len(artist_links)} artists found on Bandcamp.</p>
+<p class="legend">
+  <span class="swatch" style="background:#1da0c310;color:#1da0c3;border-bottom:1px solid #1da0c3">artist name</span> → bandcamp page (opens in new tab)
+  &nbsp;&nbsp;
+  <span class="no-match">name</span> → no bandcamp match
+</p>
 {body}
 </body></html>
 """
@@ -376,6 +468,65 @@ Listings:
 {listings}
 >>>
 """
+
+DEEP_EXTRACTION_PROMPT = """\
+You will receive event listings from a NYC experimental music calendar
+(nyc-noise.com). Extract EVERY named performing artist, band, DJ, or
+individual musician — including ones in parentheses.
+
+Rules:
+- Each comma-separated act is one entry.
+- "X (Y, Z, W)" — keep X AND also return Y, Z, W as separate entries
+  (these are usually band members or collaborators worth linking individually).
+- "A / B / C" collaborations — return the joined string AND each
+  individual ("A / B / C", "A", "B", "C").
+- "X b2b Y" DJ sets — return the joined string AND each individual.
+- "X's <project name>" — return "X" and "<project name>" separately too if the
+  project name is a proper noun (e.g. "Joe Fiedler's Big Sackbut" →
+  "Joe Fiedler", "Joe Fiedler's Big Sackbut", "Big Sackbut").
+- Strip parenthetical tags: (live), (DJ), (Album Release), (Record Release),
+  (Cassette Release), (CD Release), (Solo).
+- Skip TBA, "Special Guest", numeric placeholders, venue names,
+  presenter/curator credits, prices, and festival/series headers that
+  aren't performing entities.
+- Preserve unusual capitalization, punctuation, and diacritics exactly.
+
+Return ONLY a JSON array of strings, no duplicates. No preamble, no markdown
+fences.
+
+Listings:
+<<<
+{listings}
+>>>
+"""
+
+
+def extract_artists_deep(client: anthropic.Anthropic, listings_text: str) -> list[str]:
+    """Like extract_artists() but includes parenthetical members and split
+    collaborators. Used by --bandcamp-html where each individual is worth
+    linking, not just the headline name."""
+    msg = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=4000,
+        messages=[{
+            "role": "user",
+            "content": DEEP_EXTRACTION_PROMPT.format(listings=listings_text),
+        }],
+    )
+    text = "".join(b.text for b in msg.content if b.type == "text").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    try:
+        artists = json.loads(text)
+    except json.JSONDecodeError:
+        print("Couldn't parse Claude's deep-extraction response. Raw output:")
+        print(text)
+        return []
+    seen, out = set(), []
+    for a in artists:
+        if a and a not in seen:
+            seen.add(a); out.append(a)
+    return out
+
 
 def extract_artists(client: anthropic.Anthropic, listings_text: str) -> list[str]:
     msg = client.messages.create(
@@ -744,20 +895,26 @@ def main():
 
     # ---- Bandcamp HTML output (skips Spotify entirely) ----
     if args.bandcamp_html:
+        print("Re-running extraction in deep mode (parenthetical members included)…")
+        artists = extract_artists_deep(anthropic_client, listings)
+        print(f"Deep extraction found {len(artists)} names.\n")
+
         _, listings_html = fetch_today_listings(return_html=True)
         bc_cache = load_bandcamp_cache()
         links: dict = {}
         for a in artists:
-            if a in bc_cache:
+            # Only treat cached *hits* as authoritative — re-attempt prior
+            # misses, since the matching logic improves over time.
+            if a in bc_cache and bc_cache[a]:
                 url = bc_cache[a]
                 marker = "⌐"
             else:
-                url = bandcamp_search_artist(a)
+                url = bandcamp_search_artist(a, anthropic_client)
                 bc_cache[a] = url
                 marker = "✓" if url else "✗"
                 time.sleep(0.1)
             links[a] = url
-            print(f"  {marker} {a} → {url or '(no exact bandcamp match)'}")
+            print(f"  {marker} {a} → {url or '(no match)'}")
         save_bandcamp_cache(bc_cache)
 
         out_path = Path.home() / "Downloads" / f"nyc-noise-{date_str}.html"
