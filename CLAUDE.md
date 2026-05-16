@@ -51,6 +51,7 @@ Before running, verify:
 
 - **Use `/items`, not `/tracks`, for playlist mutations.** `POST /v1/playlists/{id}/tracks` is deprecated and Dev Mode apps now get a bare `403 Forbidden` from it with no `www-authenticate` header — easy to mistake for a scope/ownership problem. The replacement is `POST /v1/playlists/{id}/items` (same `{uris: [...]}` payload, returns `201` + `snapshot_id`). Same rename applies to `DELETE` — the new endpoint also takes a different payload shape.
 - **When debugging a Spotify 403, before suspecting scopes/ownership:** verify the endpoint isn't deprecated. Symptom pattern = reads succeed, writes 403, no `www-authenticate` / `X-Message` headers → check current docs for the endpoint path. Design-time notes (including the ones in [CHAT_CONTEXT.md](CHAT_CONTEXT.md)) can go stale; Spotify's 2026 contraction is ongoing.
+- **Verify writes by observing concrete state, not opaque version identifiers.** Spotify's `snapshot_id`, ETags, `last-modified` timestamps and similar "did the resource change?" tokens can come back stale from `GET` endpoints immediately after a successful `POST/PUT/DELETE` (CDN caching, eventual consistency between write replica and read replica). General rule: when you want to confirm a write succeeded, compare a concrete, content-derived value before vs after — track count, item list, field value, body hash. Opaque version tokens are fine for *optimistic concurrency* (passing them back in on the next write), but not as a "did my write land?" signal.
 
 ## Open improvements (in priority order)
 
