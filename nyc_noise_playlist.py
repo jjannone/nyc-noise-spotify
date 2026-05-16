@@ -486,6 +486,41 @@ def verify_playlist_name(playlist_id: str, expected_name: str, token: str) -> No
             sys.exit(0)
 
 
+def fetch_playlist_state(playlist_id: str, token: str) -> dict:
+    """Return {name, total, snapshot_id, sample} or raise if playlist is gone."""
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"https://api.spotify.com/v1/playlists/{playlist_id}",
+        headers=headers,
+    )
+    if r.status_code == 404:
+        sys.exit(
+            f"✗ Playlist {playlist_id} not found on Spotify. "
+            "It may have been deleted. Create a new one and re-run."
+        )
+    r.raise_for_status()
+    d = r.json()
+    # /items count is paginated; fetch first page just for `total` and a sample
+    r2 = requests.get(
+        f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
+        headers=headers, params={"limit": 5},
+    )
+    r2.raise_for_status()
+    items = r2.json()
+    sample = []
+    for it in items.get("items", []):
+        t = it.get("item") or it.get("track")
+        if t:
+            artists = ", ".join(a["name"] for a in t.get("artists", []))
+            sample.append(f"{artists} — {t.get('name')}")
+    return {
+        "name": d.get("name"),
+        "total": items.get("total", 0),
+        "snapshot_id": d.get("snapshot_id"),
+        "sample": sample,
+    }
+
+
 def add_tracks(playlist_id: str, uris: list[str], token: str) -> None:
     headers = {
         "Authorization": f"Bearer {token}",
@@ -576,10 +611,35 @@ def main():
         if u not in seen:
             seen.add(u); deduped.append(u)
 
-    # 5. add to playlist
+    # 5. add to playlist — with pre/post verification so silent failures can't hide
+    print("\nPlaylist BEFORE:")
+    pre = fetch_playlist_state(playlist_id, token)
+    print(f"  name:        {pre['name']}")
+    print(f"  tracks:      {pre['total']}")
+    print(f"  snapshot:    {pre['snapshot_id']}")
+    if pre["sample"]:
+        print("  first few:")
+        for s in pre["sample"]:
+            print(f"    • {s}")
+
+    expected_total = pre["total"] + len(deduped)
     if deduped:
         print(f"\nAdding {len(deduped)} tracks to playlist…")
         add_tracks(playlist_id, deduped, token)
+
+        print("\nPlaylist AFTER:")
+        post = fetch_playlist_state(playlist_id, token)
+        print(f"  name:        {post['name']}")
+        print(f"  tracks:      {post['total']} (expected {expected_total})")
+        print(f"  snapshot:    {post['snapshot_id']}")
+        if post["snapshot_id"] == pre["snapshot_id"]:
+            sys.exit("✗ Snapshot didn't change — Spotify silently rejected the write.")
+        delta = post["total"] - pre["total"]
+        if delta != len(deduped):
+            print(
+                f"⚠  Added {delta} tracks but expected {len(deduped)}. "
+                "Some URIs may have been silently dropped by Spotify."
+            )
 
     # 6. summary
     print("\n" + "─" * 50)
