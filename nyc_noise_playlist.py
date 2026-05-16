@@ -45,6 +45,7 @@ CONFIG_DIR = Path(__file__).parent / ".nyc-noise"
 TOKEN_FILE = CONFIG_DIR / "spotify_token.json"
 ARTIST_CACHE_FILE = CONFIG_DIR / "artist_cache.json"
 PLAYLIST_CACHE_FILE = CONFIG_DIR / "playlist_cache.json"
+BANDCAMP_CACHE_FILE = CONFIG_DIR / "bandcamp_cache.json"
 
 SCOPES = "playlist-modify-public playlist-modify-private playlist-read-private"
 REDIRECT_PORT = 8765
@@ -184,10 +185,12 @@ def get_spotify_token(client_id: str, redirect_uri: str) -> str:
 
 # ---------- scrape nyc-noise ----------
 
-def fetch_today_listings() -> tuple[str, str]:
+def fetch_today_listings(return_html: bool = False) -> tuple[str, str]:
     """
-    Returns (date_str, day_block_text) where date_str is MM.DD.YY for today
-    and day_block_text is the markdown-ish text under today's heading.
+    Returns (date_str, day_block) where date_str is MM.DD.YY for today.
+    By default, day_block is plain text (used for LLM extraction).
+    With return_html=True, returns the HTML fragment for today's section
+    (used for the Bandcamp-link renderer).
     """
     today = datetime.now()
     date_str = today.strftime("%m.%d.%y")
@@ -206,6 +209,14 @@ def fetch_today_listings() -> tuple[str, str]:
     if not today_h:
         sys.exit(f"Could not find today's section (#{anchor_id}) on the site.")
 
+    if return_html:
+        parts = [str(today_h)]
+        for sib in today_h.find_next_siblings():
+            if sib.name == "h4":
+                break
+            parts.append(str(sib))
+        return date_str, "\n".join(parts)
+
     chunks = []
     for sib in today_h.find_next_siblings():
         if sib.name == "h4":
@@ -213,6 +224,127 @@ def fetch_today_listings() -> tuple[str, str]:
         chunks.append(sib.get_text(" ", strip=True))
     block = "\n".join(c for c in chunks if c)
     return date_str, block
+
+
+# ---------- bandcamp ----------
+
+def load_bandcamp_cache() -> dict:
+    if BANDCAMP_CACHE_FILE.exists():
+        return json.loads(BANDCAMP_CACHE_FILE.read_text())
+    return {}
+
+
+def save_bandcamp_cache(cache: dict) -> None:
+    CONFIG_DIR.mkdir(exist_ok=True)
+    BANDCAMP_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+
+
+def bandcamp_search_artist(name: str) -> Optional[str]:
+    """Return the Bandcamp URL for an artist (band-type result), or None."""
+    try:
+        r = requests.post(
+            "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic",
+            headers={"Content-Type": "application/json"},
+            json={"search_text": name, "search_filter": "b", "full_page": False, "fan_id": None},
+            timeout=15,
+        )
+        if not r.ok:
+            return None
+        results = r.json().get("auto", {}).get("results", [])
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+
+    norm = _normalize_name(name)
+    for res in results:
+        if res.get("type") != "b":
+            continue
+        url = res.get("item_url_root") or res.get("url")
+        if _normalize_name(res.get("name", "")) == norm and url:
+            return url
+    return None
+
+
+def build_bandcamp_html(date_str: str, listings_html: str, artist_links: dict) -> str:
+    """Wrap each artist name in the listings HTML with an anchor to bandcamp.
+
+    artist_links: {artist_name: bandcamp_url_or_None}. Names with None render
+    as a struck-through span so the user can see what's missing at a glance.
+    """
+    soup = BeautifulSoup(listings_html, "html.parser")
+
+    # Sort by descending length so longer names match first (e.g. "DJ Healthy"
+    # before "DJ"), preventing inside-out replacements.
+    names_sorted = sorted(artist_links.keys(), key=len, reverse=True)
+    pattern = re.compile(
+        "|".join(re.escape(n) for n in names_sorted),
+        flags=re.IGNORECASE,
+    ) if names_sorted else None
+
+    if pattern is None:
+        body = listings_html
+    else:
+        # Walk text nodes only. For each, replace artist mentions with anchors.
+        from bs4 import NavigableString
+        for node in list(soup.find_all(string=True)):
+            if not isinstance(node, NavigableString):
+                continue
+            if node.parent and node.parent.name in {"a", "script", "style"}:
+                continue
+            text = str(node)
+            if not pattern.search(text):
+                continue
+            # Build replacement as a list of nodes
+            pieces = []
+            last = 0
+            for m in pattern.finditer(text):
+                if m.start() > last:
+                    pieces.append(text[last:m.start()])
+                matched = m.group(0)
+                # Look up canonical key by normalized name
+                key = next(
+                    (k for k in artist_links if k.lower() == matched.lower()),
+                    None,
+                )
+                url = artist_links.get(key) if key else None
+                if url:
+                    a = soup.new_tag("a", href=url, target="_blank",
+                                      rel="noopener noreferrer")
+                    a.string = matched
+                    pieces.append(a)
+                else:
+                    span = soup.new_tag("span", attrs={"class": "no-match"})
+                    span.string = matched
+                    pieces.append(span)
+                last = m.end()
+            if last < len(text):
+                pieces.append(text[last:])
+            # Replace node with the new pieces
+            for p in pieces:
+                node.insert_before(p)
+            node.extract()
+        body = str(soup)
+
+    css = """
+      body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+             max-width: 720px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }
+      h1 { font-size: 1.4em; margin-bottom: 1em; }
+      h4 { margin-top: 1.5em; }
+      a { color: #1d68d6; text-decoration: none; border-bottom: 1px solid #1d68d680; }
+      a:hover { background: #1d68d610; }
+      span.no-match { color: #999; text-decoration: line-through; }
+      .summary { color: #666; font-size: 0.9em; margin-bottom: 1.5em; }
+    """
+    matched_count = sum(1 for v in artist_links.values() if v)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<title>nyc-noise {date_str} (with bandcamp links)</title>
+<style>{css}</style></head><body>
+<h1>nyc-noise — {date_str}</h1>
+<p class="summary">{matched_count} of {len(artist_links)} artists found on Bandcamp.
+Greyed/struck names had no exact Bandcamp match.</p>
+{body}
+</body></html>
+"""
 
 
 # ---------- artist extraction via claude ----------
@@ -579,10 +711,18 @@ def main():
         action="store_true",
         help="Don't verify the playlist name matches nyc-noise-MM.DD.YY.",
     )
+    parser.add_argument(
+        "--bandcamp-html",
+        action="store_true",
+        help="Skip Spotify; write ~/Downloads/nyc-noise-MM.DD.YY.html with bandcamp links and open it.",
+    )
     args = parser.parse_args()
 
     env = load_env()
-    for k in ("SPOTIFY_CLIENT_ID", "SPOTIFY_REDIRECT_URI", "ANTHROPIC_API_KEY"):
+    required = ["ANTHROPIC_API_KEY"]
+    if not args.bandcamp_html:
+        required = ["SPOTIFY_CLIENT_ID", "SPOTIFY_REDIRECT_URI"] + required
+    for k in required:
         if not env.get(k):
             sys.exit(f"Missing {k} — set it in .env or as env var.")
 
@@ -601,6 +741,31 @@ def main():
     for a in artists:
         print(f"  • {a}")
     print()
+
+    # ---- Bandcamp HTML output (skips Spotify entirely) ----
+    if args.bandcamp_html:
+        _, listings_html = fetch_today_listings(return_html=True)
+        bc_cache = load_bandcamp_cache()
+        links: dict = {}
+        for a in artists:
+            if a in bc_cache:
+                url = bc_cache[a]
+                marker = "⌐"
+            else:
+                url = bandcamp_search_artist(a)
+                bc_cache[a] = url
+                marker = "✓" if url else "✗"
+                time.sleep(0.1)
+            links[a] = url
+            print(f"  {marker} {a} → {url or '(no exact bandcamp match)'}")
+        save_bandcamp_cache(bc_cache)
+
+        out_path = Path.home() / "Downloads" / f"nyc-noise-{date_str}.html"
+        out_path.write_text(build_bandcamp_html(date_str, listings_html, links))
+        matched = sum(1 for v in links.values() if v)
+        print(f"\nWrote {out_path}  ({matched}/{len(links)} artists linked)")
+        webbrowser.open(out_path.as_uri())
+        return
 
     # 3. spotify token + playlist
     token = get_spotify_token(env["SPOTIFY_CLIENT_ID"], env["SPOTIFY_REDIRECT_URI"])
