@@ -46,7 +46,7 @@ TOKEN_FILE = CONFIG_DIR / "spotify_token.json"
 ARTIST_CACHE_FILE = CONFIG_DIR / "artist_cache.json"
 PLAYLIST_CACHE_FILE = CONFIG_DIR / "playlist_cache.json"
 
-SCOPES = "playlist-modify-public playlist-modify-private"
+SCOPES = "playlist-modify-public playlist-modify-private playlist-read-private"
 REDIRECT_PORT = 8765
 
 NYC_NOISE_URL = "https://nyc-noise.com"
@@ -452,12 +452,41 @@ def parse_playlist_id(raw: str) -> str:
     return pid
 
 
-def prompt_for_playlist(date_str: str) -> str:
+def find_playlist_by_name(name: str, token: str) -> Optional[str]:
+    """Scan the authed user's playlists for one matching `name`.
+
+    Returns its ID or None. Requires the `playlist-read-private` scope.
+    Picks the first match (Spotify orders /me/playlists by add-to-library
+    recency, so the most recently created/added wins).
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    url = "https://api.spotify.com/v1/me/playlists?limit=50"
+    while url:
+        r = requests.get(url, headers=headers)
+        if not r.ok:
+            return None
+        data = r.json()
+        for p in data.get("items", []):
+            if p.get("name") == name:
+                return p["id"]
+        url = data.get("next")
+    return None
+
+
+def prompt_for_playlist(date_str: str, token: str) -> str:
     expected_name = f"nyc-noise-{date_str}"
     cache = load_playlist_cache()
     if date_str in cache:
         print(f"Using cached playlist ID for {date_str}: {cache[date_str]}")
         return cache[date_str]
+
+    # Try to auto-find by name before prompting
+    found = find_playlist_by_name(expected_name, token)
+    if found:
+        print(f"Found existing playlist {expected_name} (id={found}). Using it.")
+        cache[date_str] = found
+        save_playlist_cache(cache)
+        return found
 
     print()
     print("=" * 60)
@@ -581,7 +610,7 @@ def main():
         cache[date_str] = playlist_id
         save_playlist_cache(cache)
     else:
-        playlist_id = prompt_for_playlist(date_str)
+        playlist_id = prompt_for_playlist(date_str, token)
     if not args.skip_name_check:
         verify_playlist_name(playlist_id, f"nyc-noise-{date_str}", token)
 
